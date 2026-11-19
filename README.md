@@ -110,7 +110,7 @@ Xray is a fantastic general-purpose tool. Feathersock is a **focused** one — i
 ### Step 1 — Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/feathersock.git
+git clone https://github.com/Luigi69am/feathersock.git
 cd feathersock
 ```
 
