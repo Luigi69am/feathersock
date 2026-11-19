@@ -1,0 +1,10 @@
+# Feathersock — Python dependencies
+#
+# Only `cryptography` is mandatory.
+# `uvloop` and `aiofastnet` are optional accelerators (Linux/macOS only).
+
+cryptography>=41.0.0
+
+# --- Optional: performance accelerators ---
+uvloop>=0.19.0 ; sys_platform != "win32"
+aiofastnet>=0.1.0 ; sys_platform != "win32"
