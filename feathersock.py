@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Feathersock v1.0.0 — A featherweight Shadowsocks server with a web admin panel.
+Feathersock v1.1.0 — A featherweight Shadowsocks server with a web admin panel.
 
 Features:
   • Shadowsocks AEAD (AES-256-GCM / ChaCha20-Poly1305)
@@ -8,6 +8,8 @@ Features:
   • TLS-style fragmentation of first 8KB to bypass DPI
   • Per-user quota, expiry, enable/disable
   • Web admin panel + subscription endpoint
+  • Per-user public status page (/u/<token>) with config, remaining quota & time
+  • Admin panel: renew user days/quota in one click (English UI)
   • Optional UDP relay
   • Optional uvloop + aiofastnet acceleration
 
@@ -24,7 +26,7 @@ License: MIT — see LICENSE
 """
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # --- Fast CLI path (runs before heavy imports and config loading) ---
 if __name__ == "__main__" and len(sys.argv) > 1:
@@ -264,8 +266,17 @@ def fmt_time(ts):
 def atomic_write(path, text):
     p = Path(path)
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, p)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
 
 def _enc(s):
     return urllib.parse.quote(str(s), safe="")
@@ -329,25 +340,32 @@ def parse_dns_all_a(resp):
 
 async def query_one_upstream(query, upstream):
     loop = asyncio.get_running_loop()
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
         sock.connect((upstream, 53))
+        await loop.sock_sendall(sock, query)
         try:
-            await loop.sock_sendall(sock, query)
-            sock.settimeout(CONFIG["dns_timeout"])
-            try:
-                resp = await loop.sock_recv(sock, 65536)
-                _dns_health[upstream] = "OK"
-                return resp
-            except asyncio.TimeoutError:
-                _dns_health[upstream] = "TIMEOUT"
-                return None
-        finally:
-            sock.close()
+            resp = await asyncio.wait_for(
+                loop.sock_recv(sock, 65536),
+                timeout=CONFIG["dns_timeout"])
+            _dns_health[upstream] = "OK"
+            return resp
+        except asyncio.TimeoutError:
+            _dns_health[upstream] = "TIMEOUT"
+            return None
+    except asyncio.CancelledError:
+        raise
     except Exception:
         _dns_health[upstream] = "ERROR"
         return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 async def query_dns_parallel(query):
     tasks = [asyncio.create_task(query_one_upstream(query, u))
@@ -363,6 +381,8 @@ async def query_dns_parallel(query):
             if r:
                 for p in pending:
                     p.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 return r
     return None
 
@@ -723,6 +743,46 @@ def is_over_quota(u):
 def used_of(u):
     return _traffic_cache.get(u["id"], 0)
 
+def user_token(u):
+    raw = f"{u['id']}|{u['password']}".encode()
+    return base64.urlsafe_b64encode(hashlib.sha256(raw).digest()[:18]).decode().rstrip("=")
+
+def find_user_by_token(token):
+    if not token:
+        return None
+    for u in all_users():
+        exp = user_token(u)
+        if len(exp) == len(token) and secrets.compare_digest(exp, token):
+            return u
+    return None
+
+def renew_user(uid, add_days, add_gb):
+    """
+    Extend a user's expiry and/or quota.
+      - add_days > 0: if expires_at > 0, extend from max(now, expires_at);
+                      if expires_at == 0 (unlimited), skipped.
+      - add_gb   > 0: if quota_bytes > 0, add GB; if quota_bytes == 0 (unlimited), skipped.
+    Returns dict of applied changes (may be empty).
+    """
+    u = get_user(uid)
+    if not u:
+        return {}
+    kw = {}
+    applied = {}
+    if add_days and add_days > 0 and u["expires_at"] > 0:
+        base = max(now(), u["expires_at"])
+        new_exp = base + int(add_days * 86400)
+        kw["expires_at"] = new_exp
+        applied["days"] = int(add_days)
+    if add_gb and add_gb > 0 and u["quota_bytes"] > 0:
+        extra = int(round(add_gb * 1024**3))
+        if extra > 0:
+            kw["quota_bytes"] = u["quota_bytes"] + extra
+            applied["gb"] = round(extra / 1024**3, 2)
+    if kw:
+        update_user(uid, **kw)
+    return applied
+
 def load_traffic():
     global _traffic_cache
     _traffic_cache = {}
@@ -754,8 +814,8 @@ def traffic_add(uid, n):
 def traffic_flush():
     if not _traffic_pending:
         return
-    _traffic_pending.clear()
     save_traffic()
+    _traffic_pending.clear()
 
 async def flush_loop():
     while True:
@@ -847,8 +907,9 @@ a{color:#748ffc;text-decoration:none}a:hover{text-decoration:underline}
 color:#eee;border-radius:6px}button{padding:.5rem 1rem;background:#4c6ef5;color:#fff;
 border:0;border-radius:6px;cursor:pointer;font-size:.9rem}
 button.danger{background:#e03131}button.success{background:#2f9e44}
+button.renew{background:#7c3aed}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.5rem;
-border-bottom:1px solid #2a2a35}th{color:#999;font-size:.8rem}
+border-bottom:1px solid #2a2a35;vertical-align:top}th{color:#999;font-size:.8rem}
 .badge{display:inline-block;padding:.15rem .5rem;border-radius:4px;font-size:.75rem}
 .badge.on{background:#2f9e4433;color:#51cf66}.badge.off{background:#e0313133;color:#ff6b6b}
 .badge.over{background:#f59f0033;color:#ffd43b}
@@ -862,6 +923,11 @@ pre{background:#0f0f13;padding:1rem;border-radius:6px;overflow:auto;font-size:.8
 .ok{background:#2f9e4433;border-left:3px solid #51cf66;padding:.75rem;border-radius:6px;margin:.5rem 0}
 .warn{background:#f59f0033;border-left:3px solid #f59f00;padding:.75rem;border-radius:6px;margin:.5rem 0}
 code{background:#0f0f13;padding:.15rem .4rem;border-radius:4px;font-size:.85rem}
+.renew-form{display:flex;gap:.25rem;align-items:center;margin-top:.3rem;flex-wrap:wrap}
+.renew-form input{width:52px;padding:.15rem .3rem;font-size:.75rem;border:1px solid #333;
+background:#0f0f13;color:#eee;border-radius:4px}
+.renew-form button{padding:.15rem .5rem;font-size:.75rem;background:#7c3aed}
+.renew-form span{font-size:.7rem;color:#888}
 </style></head><body>"""
 
 def make_link(u):
@@ -880,6 +946,96 @@ def build_subscription():
         name = urllib.parse.quote(f"{CONFIG['name_prefix']}-{u['name']}")
         links.append(f"ss://{enc}@{CONFIG['public_host']}:{CONFIG['listen_port']}#{name}")
     return base64.b64encode("\n".join(links).encode()).decode()
+
+# --- Per-user public page ---
+def user_info_dict(u, token):
+    used = used_of(u)
+    q = u["quota_bytes"]
+    remaining = max(0, q - used) if q > 0 else None
+    exp = u["expires_at"]
+    secs_left = max(0, exp - now()) if exp else None
+    active = bool(u["enabled"]) and not is_expired(u) and not is_over_quota(u)
+    return {
+        "id": u["id"],
+        "name": u["name"],
+        "enabled": bool(u["enabled"]),
+        "active": active,
+        "used_bytes": used,
+        "quota_bytes": q,
+        "remaining_bytes": remaining,
+        "expires_at": exp,
+        "expires_at_iso": (datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
+                           if exp else None),
+        "seconds_left": secs_left,
+        "ss_link": make_link(u),
+        "page_url": f"http://{CONFIG['public_host']}:{CONFIG['sub_port']}/u/{token}",
+        "sub_url": f"http://{CONFIG['public_host']}:{CONFIG['sub_port']}/u/{token}/sub",
+    }
+
+def user_page_html(u, token):
+    link = make_link(u)
+    used = used_of(u)
+    q = u["quota_bytes"]
+    remaining = max(0, q - used) if q > 0 else None
+    exp = u["expires_at"]
+
+    if is_expired(u):
+        status_html = '<span class="badge off">منقضی شده</span>'
+    elif not u["enabled"]:
+        status_html = '<span class="badge off">غیرفعال</span>'
+    elif q > 0 and used >= q:
+        status_html = '<span class="badge over">اتمام حجم</span>'
+    else:
+        status_html = '<span class="badge on">فعال</span>'
+
+    if exp:
+        secs_left = max(0, exp - now())
+        days_left = secs_left // 86400
+        hours_left = (secs_left % 86400) // 3600
+        time_left = ("منقضی شده" if secs_left <= 0
+                     else f"{days_left} روز و {hours_left} ساعت")
+        exp_str = fmt_time(exp)
+    else:
+        time_left = "نامحدود"
+        exp_str = "—"
+
+    remaining_str = "نامحدود" if remaining is None else fmt_bytes(remaining)
+
+    if q > 0:
+        pct = min(100, int(used * 100 / q))
+        color = "#e03131" if pct >= 90 else ("#f59f00" if pct >= 70 else "#4c6ef5")
+        bar = (f'<div style="background:#0f0f13;height:12px;border-radius:6px;'
+               f'overflow:hidden;margin:.75rem 0"><div style="width:{pct}%;'
+               f'height:100%;background:{color}"></div></div>')
+        usage_line = (f'{fmt_bytes(used)} از {fmt_bytes(q)} '
+                      f'({pct}% مصرف شده) — باقی‌مانده: <b>{fmt_bytes(remaining)}</b>')
+    else:
+        bar = ""
+        usage_line = f'{fmt_bytes(used)} مصرف شده (حجم نامحدود)'
+
+    sub_url = f"http://{CONFIG['public_host']}:{CONFIG['sub_port']}/u/{token}/sub"
+    head = DASH_HEAD.replace("<html>", '<html dir="rtl" lang="fa">', 1)
+
+    return head + f'''<div class="header">
+    <h1>🪶 {html.escape(u["name"])}</h1>
+    <span>{status_html}</span>
+    </div>
+    <div class="card"><h3>وضعیت حساب</h3>
+    {bar}
+    <p style="color:#bbb;font-size:.9rem">{usage_line}</p>
+    <div class="stat"><b>حجم باقی‌مانده</b><span>{remaining_str}</span></div>
+    <div class="stat"><b>زمان باقی‌مانده</b><span>{time_left}</span></div>
+    <div class="stat"><b>تاریخ انقضا</b><span>{exp_str}</span></div>
+    </div>
+    <div class="card"><h3>کانفیگ اتصال</h3>
+    <textarea readonly onclick="this.select()" style="height:60px">{html.escape(link)}</textarea>
+    <p style="color:#888;font-size:.8rem">این لینک را کپی کرده و در کلاینت Shadowsocks خود وارد کنید.</p>
+    </div>
+    <div class="card"><h3>لینک اشتراک اختصاصی</h3>
+    <code style="word-break:break-all">{html.escape(sub_url)}</code>
+    <p style="color:#888;font-size:.8rem">با هر بار بازکردن این صفحه، آمار به‌روز نمایش داده می‌شود.</p>
+    </div>
+    </body></html>'''
 
 def dashboard_html():
     p = ['<div class="header"><h1>🪶 Feathersock</h1>'
@@ -908,7 +1064,7 @@ def dashboard_html():
     <label>Days <input name="days" type="number" min="0" value="30" style="width:60px"></label>
     <button class="success">Create</button></form></div>''')
     p.append('<div class="card"><h3>Users</h3><table><thead><tr>'
-             '<th>Name</th><th>Status</th><th>Usage</th><th>Expires</th><th>Actions</th>'
+             '<th>Name</th><th>Status</th><th>Usage</th><th>Expires</th><th>Actions / Renew</th>'
              '</tr></thead><tbody>')
     if not _users_cache:
         p.append('<tr><td colspan="5" style="text-align:center;color:#666">No users.</td></tr>')
@@ -926,28 +1082,64 @@ def dashboard_html():
             st = '<span class="badge on">Active</span>'
         qh = f'{fmt_bytes(used)} / {fmt_bytes(q)}' if q else f'{fmt_bytes(used)} / ∞'
         nm = html.escape(u["name"])
+        tok = user_token(u)
         p.append(f'''<tr><td>{nm}</td><td>{st}</td><td>{qh}</td>
         <td>{fmt_time(u["expires_at"])}</td>
-        <td><a href="/config/{uid}">config</a> ·
-        <form method="POST" action="/reset/{uid}" style="display:inline"
-        onsubmit="return confirm('Reset?')"><button style="padding:.2rem .4rem;font-size:.75rem">Reset</button></form> ·
-        <form method="POST" action="/toggle/{uid}" style="display:inline">
-        <button style="padding:.2rem .4rem;font-size:.75rem">{"Off" if u["enabled"] else "On"}</button></form> ·
-        <form method="POST" action="/delete/{uid}" style="display:inline"
-        onsubmit="return confirm('Delete?')"><button class="danger" style="padding:.2rem .4rem;font-size:.75rem">Del</button></form>
+        <td>
+          <a href="/config/{uid}">config</a> ·
+          <a href="/u/{tok}" target="_blank">public</a> ·
+          <form method="POST" action="/reset/{uid}" style="display:inline"
+          onsubmit="return confirm('Reset?')"><button style="padding:.2rem .4rem;font-size:.75rem">Reset</button></form> ·
+          <form method="POST" action="/toggle/{uid}" style="display:inline">
+          <button style="padding:.2rem .4rem;font-size:.75rem">{"Off" if u["enabled"] else "On"}</button></form> ·
+          <form method="POST" action="/delete/{uid}" style="display:inline"
+          onsubmit="return confirm('Delete?')"><button class="danger" style="padding:.2rem .4rem;font-size:.75rem">Del</button></form>
+          <form method="POST" action="/renew/{uid}" class="renew-form"
+                onsubmit="return confirm('Renew this user?')">
+            <span>+</span>
+            <input name="add_days" type="number" min="0" value="30" title="Add days">
+            <span>d</span>
+            <input name="add_gb" type="number" min="0" step="0.1" value="0" title="Add GB">
+            <span>GB</span>
+            <button class="renew">Renew</button>
+          </form>
         </td></tr>''')
     p.append("</tbody></table></div></body></html>")
     return DASH_HEAD + "".join(p)
 
 def config_html(u):
     link = html.escape(make_link(u))
-    sub = f"http://{CONFIG['public_host']}:{CONFIG['sub_port']}/sub"
+    tok = user_token(u)
+    main_base = f"http://{CONFIG['public_host']}:{CONFIG['listen_port']}/u/{tok}"
+    sub_base = f"http://{CONFIG['public_host']}:{CONFIG['sub_port']}/u/{tok}"
+    sub_url = f"http://{CONFIG['public_host']}:{CONFIG['sub_port']}/sub"
+    uid = u["id"]
     return DASH_HEAD + f'''<div class="header">
     <h1>{html.escape(u["name"])}</h1><a href="/">← Back</a></div>
     <div class="card"><h3>Link</h3>
     <textarea readonly onclick="this.select()">{link}</textarea>
     <p style="color:#888;font-size:.85rem">Pass: <code>{html.escape(u["password"])}</code></p></div>
-    <div class="card"><h3>Sub URL</h3><code>{html.escape(sub)}</code></div></body></html>'''
+    <div class="card"><h3>Renew</h3>
+    <form method="POST" action="/renew/{uid}" class="row"
+          onsubmit="return confirm('Renew this user?')">
+      <label>Days <input name="add_days" type="number" min="0" value="30" style="width:80px"></label>
+      <label>GB <input name="add_gb" type="number" min="0" step="0.1" value="0" style="width:80px"></label>
+      <button class="renew">Renew</button>
+    </form>
+    <p style="color:#888;font-size:.8rem">
+      If the user's quota or time is <b>unlimited (0)</b>, renew is skipped.
+      To convert unlimited to limited, create a new user or delete + recreate.
+    </p>
+    </div>
+    <div class="card"><h3>Per-user page</h3>
+    <p style="margin:.25rem 0">Main port: <code>{html.escape(main_base)}</code></p>
+    <p style="margin:.25rem 0">Sub port:&nbsp; <code>{html.escape(sub_base)}</code></p>
+    <p style="margin:.25rem 0">JSON: <code>{html.escape(main_base)}/json</code></p>
+    <p style="margin:.25rem 0">Sub:&nbsp;&nbsp;&nbsp;&nbsp; <code>{html.escape(main_base)}/sub</code></p>
+    <p style="color:#888;font-size:.8rem">No login required — the token is the secret.</p>
+    </div>
+    <div class="card"><h3>Global Sub URL</h3><code>{html.escape(sub_url)}</code></div>
+    </body></html>'''
 
 # =============================================================
 # HTTP handler
@@ -1014,6 +1206,34 @@ async def handle_http(reader, writer, first5):
     if path == "/favicon.ico":
         await send_response(writer, 204, "text/plain", b"")
         return
+
+    # --- Per-user public page (no admin login) ---
+    if path.startswith("/u/"):
+        parts_u = path[3:].strip("/").split("/")
+        token = parts_u[0] if parts_u else ""
+        u = find_user_by_token(token)
+        if not u:
+            await send_response(writer, 404, "text/plain", "Not found")
+            return
+        sub = parts_u[1] if len(parts_u) > 1 else ""
+        if sub == "sub":
+            if not u["enabled"] or is_expired(u) or is_over_quota(u):
+                await send_response(writer, 200, "text/plain", "")
+            else:
+                body_b64 = base64.b64encode(make_link(u).encode()).decode()
+                await send_response(writer, 200, "text/plain", body_b64)
+            return
+        if sub == "json":
+            info = user_info_dict(u, token)
+            await send_response(writer, 200, "application/json",
+                                json.dumps(info, ensure_ascii=False, indent=2))
+            return
+        if sub:
+            await send_response(writer, 404, "text/plain", "Not found")
+            return
+        await send_response(writer, 200, "text/html", user_page_html(u, token))
+        return
+
     if path == "/diag":
         await send_response(writer, 200, "application/json", json.dumps({
             "uptime_sec": int(time.time() - START_TIME),
@@ -1120,6 +1340,25 @@ async def handle_http(reader, writer, first5):
             _traffic_cache[uid] = 0
             _traffic_pending.pop(uid, None)
             save_traffic()
+            await send_response(writer, 302, "text/plain", "", ["Location: /"])
+            return
+        if action == "renew" and method == "POST":
+            try:
+                add_days = int(form.get("add_days", ["0"])[0] or 0)
+            except ValueError:
+                add_days = 0
+            try:
+                add_gb = float(form.get("add_gb", ["0"])[0] or 0)
+            except ValueError:
+                add_gb = 0
+            applied = renew_user(uid, add_days, add_gb)
+            if applied:
+                bits = []
+                if "days" in applied:
+                    bits.append(f"+{applied['days']}d")
+                if "gb" in applied:
+                    bits.append(f"+{applied['gb']}GB")
+                log(f"renew #{uid} {' '.join(bits)}")
             await send_response(writer, 302, "text/plain", "", ["Location: /"])
             return
 
@@ -1287,9 +1526,15 @@ async def handle_ss(reader, writer, initial):
                 if local:
                     traffic_add(uid, local)
 
-        await asyncio.wait(
-            [asyncio.create_task(c2t()), asyncio.create_task(t2c())],
-            return_when=asyncio.FIRST_COMPLETED)
+        t_c2t = asyncio.create_task(c2t())
+        t_t2c = asyncio.create_task(t2c())
+        try:
+            await asyncio.wait([t_c2t, t_t2c], return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (t_c2t, t_t2c):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(t_c2t, t_t2c, return_exceptions=True)
     except Exception as e:
         dbg(f"ss: {type(e).__name__}: {e!r}")
     finally:
@@ -1354,19 +1599,26 @@ async def handle_ss_udp(data, addr, transport):
         loop = asyncio.get_running_loop()
         resp = None
         for ip in ips[:3]:
+            sock = None
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+                sock = socket.socket(family, socket.SOCK_DGRAM)
                 sock.setblocking(False)
                 sock.connect((ip, port))
-                try:
-                    await loop.sock_sendall(sock, payload)
-                    sock.settimeout(3)
-                    resp = await loop.sock_recv(sock, 65536)
-                    break
-                finally:
-                    sock.close()
+                await loop.sock_sendall(sock, payload)
+                resp = await asyncio.wait_for(
+                    loop.sock_recv(sock, 65536), timeout=3)
+                break
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 continue
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
         if not resp:
             _recent.append((now(), str(addr), f"UDP {addr_str}:{port} timeout"))
             return
@@ -1436,16 +1688,50 @@ async def dispatch(reader, writer):
 def subscription_http_thread():
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path in ("/sub", "/sub.txt"):
+            p = self.path.split("?", 1)[0]
+
+            if p in ("/sub", "/sub.txt"):
                 c = build_subscription()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(c)))
-                self.end_headers()
-                self.wfile.write(c.encode())
-            else:
-                self.send_response(404)
-                self.end_headers()
+                self._send(c.encode(), "text/plain; charset=utf-8")
+                return
+
+            if p.startswith("/u/"):
+                parts_u = p[3:].strip("/").split("/")
+                token = parts_u[0] if parts_u else ""
+                u = find_user_by_token(token)
+                if not u:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                sub = parts_u[1] if len(parts_u) > 1 else ""
+                if sub == "sub":
+                    if not u["enabled"] or is_expired(u) or is_over_quota(u):
+                        self._send(b"", "text/plain; charset=utf-8")
+                    else:
+                        body_b64 = base64.b64encode(make_link(u).encode()).decode()
+                        self._send(body_b64.encode(), "text/plain; charset=utf-8")
+                    return
+                if sub == "json":
+                    info = user_info_dict(u, token)
+                    self._send(json.dumps(info, ensure_ascii=False, indent=2).encode(),
+                               "application/json; charset=utf-8")
+                    return
+                if sub:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._send(user_page_html(u, token).encode(), "text/html; charset=utf-8")
+                return
+
+            self.send_response(404)
+            self.end_headers()
+
+        def _send(self, data, ctype):
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def log_message(self, *a):
             pass
@@ -1503,6 +1789,13 @@ async def main():
         lsock.setblocking(False)
     except OSError as e:
         log(f"FATAL bind: {e}")
+        try:
+            for t in asyncio.all_tasks(loop):
+                t.cancel()
+            loop.run_until_complete(
+                asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True))
+        except Exception:
+            pass
         sys.exit(1)
 
     try:
@@ -1518,6 +1811,7 @@ async def main():
     log(f"LISTENING TCP {CONFIG['listen_host']}:{CONFIG['listen_port']}")
     log(f"Panel: http://{CONFIG['public_host']}:{CONFIG['listen_port']}/")
     log(f"Sub:   http://{CONFIG['public_host']}:{CONFIG['sub_port']}/sub")
+    log(f"User pages: http://{CONFIG['public_host']}:{CONFIG['sub_port']}/u/<token>")
     log(f"Speed: read_chunk={CONFIG['read_chunk']} frag_burst={CONFIG['frag_burst_limit']}")
 
     async with server:
@@ -1525,7 +1819,6 @@ async def main():
 
 def run_server():
     """Launch with the best available event loop. Compatible with Python 3.9+."""
-    # 1) Enable aiofastnet via install_policy (works on all supported versions)
     if AIOFASTNET_AVAILABLE:
         try:
             aiofastnet.install_policy()
@@ -1533,7 +1826,6 @@ def run_server():
         except Exception as e:
             log(f"⚠️  aiofastnet.install_policy failed: {e} — continuing with standard asyncio")
 
-    # 2) Choose event loop: uvloop if available, else standard asyncio
     try:
         if UVLOOP_AVAILABLE:
             loop = uvloop.new_event_loop()
@@ -1545,7 +1837,6 @@ def run_server():
         log(f"⚠️  loop create failed: {e} — falling back to asyncio")
         loop = asyncio.new_event_loop()
 
-    # 3) Run main() with the chosen loop (no loop_factory needed for Py<3.12)
     try:
         asyncio.set_event_loop(loop)
         loop.run_until_complete(main())
